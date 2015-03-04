@@ -2,13 +2,11 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE StandaloneDeriving #-}
 module Diagrams.Backend.GL (
     GL(..),
@@ -19,20 +17,14 @@ module Diagrams.Backend.GL (
 
 import Data.Foldable (foldMap, toList)
 import qualified Data.Text as T
-import Data.Text (Text)
-import qualified Data.Tree as Tr
 import Data.Tree (Tree(..))
 import qualified Data.Map as M
 import Data.Map (Map)
-import Data.Maybe
 import Data.Default
 
-import Control.Arrow ((&&&))
-import Control.Monad
 import Control.Monad.Reader 
 import Control.Monad.State
 import Data.Typeable
-import qualified Data.Vector as V
 import qualified Data.Vector.Storable as VS
 
 import Diagrams.Core.Compile
@@ -40,18 +32,13 @@ import Diagrams.Core.Types (Annotation (..))
 import Diagrams.Core.Style
 
 import Diagrams.Prelude hiding (view, (.~))
-import Diagrams.TwoD.Adjust
-import Diagrams.TwoD.Attributes hiding (FillTexture, LineTexture, LineWidth)
 import qualified Diagrams.TwoD.Path as Dia
-import Diagrams.TwoD.Size
-import Diagrams.TwoD.Text
 import Codec.Picture
 
 import Graphics.GL
 import Graphics.GL.Low.Shader
 import Graphics.GL.Low hiding (Texture)
 
-import Math.Spline
 import Control.Lens
 import qualified Linear as L
 import Linear hiding (_x, _y, R2)
@@ -91,6 +78,7 @@ deriving instance (Eq (Options GL r)) => Eq (GLRenderContext r)
 deriving instance (Ord (Options GL r)) => Ord (GLRenderContext r)
 deriving instance (Show (Options GL r)) => Show (GLRenderContext r)
 
+-- | Collects the line style information that we can render usefully
 data GLLineStyle = GLLineStyle
     { _lsColor :: GLColor
     , _lsWidth :: Double
@@ -98,6 +86,7 @@ data GLLineStyle = GLLineStyle
     , _lsJoin  :: LineJoin
     } deriving (Eq, Ord, Show, Typeable)
 
+-- | Collects the fill style information that we can render usefully
 data GLFillStyle = GLFillStyle
     { _fsColor :: GLColor
     } deriving (Eq, Ord, Show, Typeable)
@@ -146,7 +135,7 @@ instance Backend GL R2 where
     data    Options GL R2 = GLOptionsR2 
                 { _smoothness :: Int
                 } deriving (Eq, Ord, Show)
-    renderRTree _ opts rt = runRenderGL2 (renderRTreeGL2 opts rt) cxt st
+    renderRTree _ opts rt = runRenderGL2 (renderRTreeGL2 rt) cxt st
       where cxt = initialDiagramContext opts
             st  = initialDiagramState
 
@@ -166,13 +155,13 @@ instance Monoid (Render GL R2) where
 smoothness :: Lens' (Options GL R2) Int
 smoothness = lens _smoothness (\opt s -> opt { _smoothness = s})
 
-renderRTreeGL2 :: Options GL R2 -> RTree GL R2 Annotation -> Render GL R2
-renderRTreeGL2 opts (Node (RAnnot a) rs) = foldMap (renderRTreeGL2 opts) rs
-renderRTreeGL2 opts (Node REmpty     rs) = foldMap (renderRTreeGL2 opts) rs
-renderRTreeGL2 opts (Node (RStyle s) rs) = withStyle s $ foldMap (renderRTreeGL2 opts) rs
-renderRTreeGL2 opts (Node (RPrim  p) []) = render GL p
-renderRTreeGL2 opts (Node (RPrim  p) rs) = render GL p  -- this should never happen
-                                 `mappend` foldMap (renderRTreeGL2 opts) rs
+renderRTreeGL2 :: RTree GL R2 Annotation -> Render GL R2
+renderRTreeGL2 (Node (RAnnot _) rs) = foldMap (renderRTreeGL2) rs
+renderRTreeGL2 (Node REmpty     rs) = foldMap (renderRTreeGL2) rs
+renderRTreeGL2 (Node (RStyle s) rs) = withStyle s $ foldMap (renderRTreeGL2) rs
+renderRTreeGL2 (Node (RPrim  p) []) = render GL p
+renderRTreeGL2 (Node (RPrim  p) rs) = render GL p  -- this should never happen
+                                 `mappend` foldMap (renderRTreeGL2) rs
 
 localStyle :: Attribute v -> GLDiagramContext r -> GLDiagramContext r
 localStyle (FillTexture (SC clr)) = cxtFillStyle.fsColor .~ GLColor (colorToSRGBA clr)
@@ -188,6 +177,7 @@ withStyle (Style s) = localR . appEndo . foldMap (Endo . localStyle) $ M.elems s
 attrOf :: (AttributeClass a) => (a -> b) -> Attribute v -> Maybe b
 attrOf f = fmap f . unwrapAttr
 
+-- | Get the shader program, loading it if necessary
 getShader = do
     sh <- use diaShader
     case sh of
@@ -227,8 +217,10 @@ instance Renderable (Path R2) GL where
             setUniform44 (T.pack "proj") [proj]
             setUniform4f (T.pack "drawColor") [realToFrac <$> fromColor (lstyle^.lsColor)]
             
-            bindElementArray ebl
-            drawIndexedLines (fromIntegral . length $ ixs) UIntIndices
+            when renderl $ do
+                bindElementArray ebl
+                drawIndexedLines (fromIntegral . length $ ixs) UIntIndices
+            
             return ()
 
 linesVisible :: Path R2 -> GLLineStyle -> Bool
@@ -261,7 +253,7 @@ connectVerts :: [LineVertex R2] -> [LineVertex R2] -> GLDiagramT R2 IO [LineVert
 connectVerts l1 l2 = case (lastOf each l1, firstOf each l2) of
     (Nothing, _) -> return l2
     (_, Nothing) -> return l1
-    (Just lv1@(LV v1 n1), Just lv2@(LV v2 n2)) -> do
+    (Just lv1, Just lv2) -> do
         merge <- closeEnough lv1 lv2
         if merge 
           then return $ l1 ++ drop 1 l2
